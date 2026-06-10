@@ -28,6 +28,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels-path", required=True)
     parser.add_argument("--critic-checkpoint", required=True)
     parser.add_argument("--pi0-checkpoint", default=None, help="PI0 checkpoint dir or model.safetensors path")
+    parser.add_argument("--allow-random-pi0", action="store_true", help="Debug only: allow random PI0 features")
+    parser.add_argument("--lerobot-root", default=None, help="Root containing local LeRobot datasets")
+    parser.add_argument("--dataset-names", nargs="*", default=None, help="Dataset names or paths to load")
+    parser.add_argument("--libero-suite", default=None, help="LIBERO suite shortcut: spatial|goal|object|libero_10|all")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-batches", type=int, default=None)
@@ -63,6 +67,21 @@ def _resolve_model_safetensors(path: str | None, config: _config.TrainConfig) ->
     return candidate_path
 
 
+def _resolve_dataset_paths(args: argparse.Namespace) -> list[str] | None:
+    dataset_paths = action_gain_data.resolve_lerobot_dataset_paths(
+        lerobot_root=args.lerobot_root,
+        dataset_names=args.dataset_names,
+        libero_suite=args.libero_suite,
+    )
+    if dataset_paths is None and args.lerobot_root is not None:
+        with np.load(args.labels_path, allow_pickle=True) as npz:
+            if "dataset_key" not in npz:
+                raise KeyError("labels_path must contain dataset_key when inferring datasets from --lerobot-root")
+            dataset_keys = sorted({Path(str(key)).name for key in npz["dataset_key"]})
+        dataset_paths = [str(Path(args.lerobot_root) / key) for key in dataset_keys]
+    return dataset_paths
+
+
 def load_frozen_pi0(
     config: _config.TrainConfig,
     args: argparse.Namespace,
@@ -72,6 +91,10 @@ def load_frozen_pi0(
     checkpoint = _resolve_model_safetensors(args.pi0_checkpoint, config)
     if checkpoint is not None:
         safetensors.torch.load_model(model, checkpoint, device=str(device))
+    elif not args.allow_random_pi0:
+        raise ValueError(
+            "A PI0 checkpoint is required. Pass --pi0-checkpoint or use --allow-random-pi0 for debug only."
+        )
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
@@ -94,6 +117,7 @@ def main() -> None:
     config = _config.get_config(args.config_name)
     device = torch.device(args.device)
     batch_size = config.batch_size if args.batch_size is None else args.batch_size
+    dataset_paths = _resolve_dataset_paths(args)
 
     loader, _ = action_gain_data.create_action_gain_data_loader(
         config,
@@ -102,8 +126,16 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         seed=config.seed,
+        dataset_paths=dataset_paths,
         skip_norm_stats=args.skip_norm_stats,
     )
+    for preview in loader.dataset.preview_identities(5):
+        print(
+            "label/sample key: "
+            f"dataset={preview['dataset_key']} episode={preview['episode_index']} "
+            f"frame={preview['frame_index']} next_frame={preview['next_frame_index']} "
+            f"raw_index={preview['raw_index']} label_index={preview['label_index']}"
+        )
     gain_atoms = torch.as_tensor(loader.dataset.gain_atoms, dtype=torch.float32, device=device)
 
     pi0 = load_frozen_pi0(config, args, device)
@@ -167,8 +199,11 @@ def main() -> None:
                 for i in range(batch_size_actual):
                     rows.append(
                         {
+                            "dataset_key": metadata["dataset_key"][i],
                             "episode_index": metadata["episode_index"][i],
                             "frame_index": int(metadata["frame_index"][i]),
+                            "next_frame_index": int(metadata["next_frame_index"][i]),
+                            "raw_index": int(metadata["raw_index"][i]),
                             "target_gain_mean": float(target_gain[i].cpu()),
                             "pred_gain_mean": float(pred_gain[i].cpu()),
                             "target_p_up": float(target_aggr["p_up"][i].cpu()),

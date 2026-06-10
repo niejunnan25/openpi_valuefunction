@@ -131,7 +131,20 @@ def _scalar(value: Any) -> Any:
     return value
 
 
-def _extract_episode_frame(example: dict[str, Any]) -> tuple[Any, int]:
+def _dataset_key(value: Any) -> str:
+    value = _scalar(value)
+    text = str(value)
+    return Path(text).name if "/" in text else text
+
+
+def _extract_identity(example: dict[str, Any], default_dataset_key: str) -> tuple[str, Any, int, int]:
+    dataset = None
+    for key in ("dataset_key", "dataset_path", "repo_id"):
+        if key in example:
+            dataset = example[key]
+            break
+    dataset = default_dataset_key if dataset is None else dataset
+
     episode = None
     for key in ("episode_index", "episode_id", "trajectory_id", "traj_id"):
         if key in example:
@@ -147,7 +160,12 @@ def _extract_episode_frame(example: dict[str, Any]) -> tuple[Any, int]:
             "JoyRA examples must expose episode/frame metadata. "
             "Expected episode_index or trajectory_id, and frame_index or step."
         )
-    return episode, frame
+    raw_index = -1
+    for key in ("raw_index", "dataset_index"):
+        if key in example:
+            raw_index = int(_scalar(example[key]))
+            break
+    return _dataset_key(dataset), episode, frame, raw_index
 
 
 def main() -> None:
@@ -157,6 +175,8 @@ def main() -> None:
 
     episode_index = []
     frame_index = []
+    dataset_key = []
+    raw_index = []
     value_logits = []
     value_probs = []
     value_mean = []
@@ -175,9 +195,11 @@ def main() -> None:
             values = np.asarray(result.get("values"), dtype=np.float32)
 
             for example in batch:
-                ep, fr = _extract_episode_frame(example)
+                ds, ep, fr, raw = _extract_identity(example, args.data_mix)
+                dataset_key.append(ds)
                 episode_index.append(ep)
                 frame_index.append(fr)
+                raw_index.append(raw)
                 success.append(bool(example.get("success", False)))
 
             value_logits.append(logits)
@@ -190,13 +212,17 @@ def main() -> None:
     atoms = np.linspace(args.value_min, args.value_max, args.value_num_bins, dtype=np.float32)
     np.savez_compressed(
         output,
+        dataset_key=np.asarray(dataset_key),
         episode_index=np.asarray(episode_index),
         frame_index=np.asarray(frame_index, dtype=np.int64),
+        raw_index=np.asarray(raw_index, dtype=np.int64),
         value_logits=np.concatenate(value_logits, axis=0).astype(np.float32),
         value_probs=np.concatenate(value_probs, axis=0).astype(np.float32),
         value_mean=np.concatenate(value_mean, axis=0).astype(np.float32),
         value_atoms=atoms,
         success=np.asarray(success, dtype=bool),
+        data_mix=np.asarray(args.data_mix),
+        data_root_dir=np.asarray(args.data_root_dir),
     )
     print(f"Exported {exported} value distributions to {output}")
 

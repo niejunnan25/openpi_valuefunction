@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,12 @@ def _episode_key(value) -> str:
     return str(int(value)) if isinstance(value, int | np.integer) else str(value)
 
 
+def _dataset_key(value) -> str:
+    value = value.item() if hasattr(value, "item") else value
+    text = str(value)
+    return Path(text).name if "/" in text else text
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--value-distributions", required=True, help="Input NPZ from export_value_distributions.py")
@@ -39,12 +46,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gain-num-bins", type=int, default=101)
     parser.add_argument("--eta", type=float, default=0.02, help="Flat/up/down aggregation threshold")
     parser.add_argument("--batch-size", type=int, default=8192, help="CPU label projection batch size")
+    parser.add_argument(
+        "--default-dataset-key",
+        default=None,
+        help="Optional dataset key for legacy value NPZ files without dataset_key. Avoid this for LIBERO all.",
+    )
+    parser.add_argument(
+        "--allow-nonconsecutive-frames",
+        action="store_true",
+        help="Use the K-th exported frame even when next_frame_index - frame_index != K.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     with np.load(args.value_distributions, allow_pickle=True) as npz:
+        if "dataset_key" in npz:
+            dataset_key = np.asarray(npz["dataset_key"])
+        elif args.default_dataset_key is not None:
+            value_count = np.asarray(npz["value_probs"]).shape[0]
+            dataset_key = np.full(value_count, args.default_dataset_key)
+        else:
+            raise KeyError(
+                "value distribution NPZ must contain dataset_key. "
+                "Use --default-dataset-key only for a known single-dataset legacy export."
+            )
         episode_index = _pick_array(npz, "episode_index", "episode_id")
         frame_index = _pick_array(npz, "frame_index", "frame_id").astype(np.int64)
         value_probs = np.asarray(npz["value_probs"], dtype=np.float32)
@@ -53,24 +80,42 @@ def main() -> None:
             if "value_atoms" in npz
             else np.linspace(args.value_min, args.value_max, args.value_num_bins, dtype=np.float32)
         )
-        dataset_index = np.asarray(npz["dataset_index"], dtype=np.int64) if "dataset_index" in npz else None
+        raw_index = np.asarray(npz["raw_index"], dtype=np.int64) if "raw_index" in npz else None
 
     if value_probs.ndim != 2:
         raise ValueError(f"value_probs must have shape [N, M], got {value_probs.shape}")
+    if dataset_key.shape[0] != value_probs.shape[0]:
+        raise ValueError(f"dataset_key has {dataset_key.shape[0]} rows but value_probs has {value_probs.shape[0]}")
+    if episode_index.shape[0] != value_probs.shape[0] or frame_index.shape[0] != value_probs.shape[0]:
+        raise ValueError("dataset_key, episode_index, frame_index, and value_probs must have the same row count")
     if value_probs.shape[1] != len(value_atoms_np):
         raise ValueError(f"value_probs has {value_probs.shape[1]} bins but value_atoms has {len(value_atoms_np)}")
 
-    key_to_row = {
-        (_episode_key(ep), int(fr)): i for i, (ep, fr) in enumerate(zip(episode_index, frame_index, strict=True))
-    }
+    group_to_rows: dict[tuple[str, str], list[int]] = defaultdict(list)
+    seen_keys: set[tuple[str, str, int]] = set()
+    for i, (ds, ep, fr) in enumerate(zip(dataset_key, episode_index, frame_index, strict=True)):
+        key = (_dataset_key(ds), _episode_key(ep), int(fr))
+        if key in seen_keys:
+            raise ValueError(f"Duplicate value distribution key found: {key}")
+        seen_keys.add(key)
+        group_to_rows[(key[0], key[1])].append(i)
+
     curr_rows: list[int] = []
     next_rows: list[int] = []
-    for i, (ep, fr) in enumerate(zip(episode_index, frame_index, strict=True)):
-        next_row = key_to_row.get((_episode_key(ep), int(fr) + args.horizon))
-        if next_row is None:
-            continue
-        curr_rows.append(i)
-        next_rows.append(next_row)
+    skipped_nonconsecutive = 0
+    for rows in group_to_rows.values():
+        rows = sorted(rows, key=lambda row: int(frame_index[row]))
+        for pos, row in enumerate(rows):
+            next_pos = pos + args.horizon
+            if next_pos >= len(rows):
+                continue
+            next_row = rows[next_pos]
+            frame_delta = int(frame_index[next_row]) - int(frame_index[row])
+            if not args.allow_nonconsecutive_frames and frame_delta != args.horizon:
+                skipped_nonconsecutive += 1
+                continue
+            curr_rows.append(row)
+            next_rows.append(next_row)
 
     if not curr_rows:
         raise ValueError(f"No t/t+K pairs found for horizon={args.horizon}")
@@ -93,6 +138,7 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     save_kwargs = {
+        "dataset_key": np.asarray([_dataset_key(x) for x in dataset_key[curr_rows]]),
         "episode_index": episode_index[curr_rows],
         "frame_index": frame_index[curr_rows],
         "next_frame_index": frame_index[next_rows],
@@ -106,10 +152,15 @@ def main() -> None:
         "horizon": np.asarray(args.horizon, dtype=np.int64),
         "eta": np.asarray(args.eta, dtype=np.float32),
     }
-    if dataset_index is not None:
-        save_kwargs["dataset_index"] = dataset_index[curr_rows]
+    if raw_index is not None:
+        save_kwargs["raw_index"] = raw_index[curr_rows]
     np.savez_compressed(output, **save_kwargs)
     print(f"Saved {len(curr_rows)} gain labels to {output}")
+    if skipped_nonconsecutive:
+        print(
+            f"Skipped {skipped_nonconsecutive} non-consecutive pairs. "
+            "Pass --allow-nonconsecutive-frames only if K means K exported frames."
+        )
 
 
 if __name__ == "__main__":

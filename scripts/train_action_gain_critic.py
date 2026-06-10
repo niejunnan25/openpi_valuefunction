@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels-path", required=True, help="Gain label NPZ from build_gain_distribution_labels.py")
     parser.add_argument("--output-dir", required=True, help="Directory for critic checkpoints")
     parser.add_argument("--pi0-checkpoint", default=None, help="PI0 checkpoint dir or model.safetensors path")
+    parser.add_argument("--allow-random-pi0", action="store_true", help="Debug only: allow random PI0 features")
+    parser.add_argument("--lerobot-root", default=None, help="Root containing local LeRobot datasets")
+    parser.add_argument("--dataset-names", nargs="*", default=None, help="Dataset names or paths to load")
+    parser.add_argument("--libero-suite", default=None, help="LIBERO suite shortcut: spatial|goal|object|libero_10|all")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--num-train-steps", type=int, default=None)
@@ -82,6 +86,21 @@ def _resolve_model_safetensors(path: str | None, config: _config.TrainConfig) ->
     return candidate_path
 
 
+def _resolve_dataset_paths(args: argparse.Namespace) -> list[str] | None:
+    dataset_paths = action_gain_data.resolve_lerobot_dataset_paths(
+        lerobot_root=args.lerobot_root,
+        dataset_names=args.dataset_names,
+        libero_suite=args.libero_suite,
+    )
+    if dataset_paths is None and args.lerobot_root is not None:
+        with np.load(args.labels_path, allow_pickle=True) as npz:
+            if "dataset_key" not in npz:
+                raise KeyError("labels_path must contain dataset_key when inferring datasets from --lerobot-root")
+            dataset_keys = sorted({Path(str(key)).name for key in npz["dataset_key"]})
+        dataset_paths = [str(Path(args.lerobot_root) / key) for key in dataset_keys]
+    return dataset_paths
+
+
 def load_frozen_pi0(
     config: _config.TrainConfig,
     args: argparse.Namespace,
@@ -92,6 +111,10 @@ def load_frozen_pi0(
     if checkpoint is not None:
         logging.info("Loading frozen PI0 weights from %s", checkpoint)
         safetensors.torch.load_model(model, checkpoint, device=str(device))
+    elif not args.allow_random_pi0:
+        raise ValueError(
+            "A PI0 checkpoint is required. Pass --pi0-checkpoint or use --allow-random-pi0 for debug only."
+        )
     else:
         logging.warning("No PI0 checkpoint was provided; training critic on randomly initialized PI0 features.")
 
@@ -145,6 +168,7 @@ def main() -> None:
     batch_size = config.batch_size if args.batch_size is None else args.batch_size
     num_workers = config.num_workers if args.num_workers is None else args.num_workers
     num_train_steps = config.num_train_steps if args.num_train_steps is None else args.num_train_steps
+    dataset_paths = _resolve_dataset_paths(args)
 
     loader, _ = action_gain_data.create_action_gain_data_loader(
         config,
@@ -153,8 +177,19 @@ def main() -> None:
         shuffle=True,
         num_workers=num_workers,
         seed=seed,
+        dataset_paths=dataset_paths,
         skip_norm_stats=args.skip_norm_stats,
     )
+    for preview in loader.dataset.preview_identities(5):
+        logging.info(
+            "label/sample key: dataset=%s episode=%s frame=%s next_frame=%s raw_index=%s label_index=%s",
+            preview["dataset_key"],
+            preview["episode_index"],
+            preview["frame_index"],
+            preview["next_frame_index"],
+            preview["raw_index"],
+            preview["label_index"],
+        )
     gain_atoms = torch.as_tensor(loader.dataset.gain_atoms, dtype=torch.float32, device=device)
 
     pi0 = load_frozen_pi0(config, args, device)
