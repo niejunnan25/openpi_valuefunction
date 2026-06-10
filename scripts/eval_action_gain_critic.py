@@ -32,6 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lerobot-root", default=None, help="Root containing local LeRobot datasets")
     parser.add_argument("--dataset-names", nargs="*", default=None, help="Dataset names or paths to load")
     parser.add_argument("--libero-suite", default=None, help="LIBERO suite shortcut: spatial|goal|object|libero_10|all")
+    parser.add_argument("--assets-base-dir", default=None, help="Override TrainConfig assets_base_dir")
+    parser.add_argument("--norm-stats-path", default=None, help="Path to norm_stats.json or its containing directory")
+    parser.add_argument(
+        "--no-filter-episodes-from-labels",
+        action="store_true",
+        help="Debug only: load full datasets instead of the episodes referenced by labels.",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-batches", type=int, default=None)
@@ -115,6 +122,8 @@ def _js_div(target: torch.Tensor, pred: torch.Tensor, eps: float = 1e-8) -> torc
 def main() -> None:
     args = parse_args()
     config = _config.get_config(args.config_name)
+    if args.assets_base_dir is not None:
+        config = dataclasses.replace(config, assets_base_dir=args.assets_base_dir)
     device = torch.device(args.device)
     batch_size = config.batch_size if args.batch_size is None else args.batch_size
     dataset_paths = _resolve_dataset_paths(args)
@@ -128,6 +137,8 @@ def main() -> None:
         seed=config.seed,
         dataset_paths=dataset_paths,
         skip_norm_stats=args.skip_norm_stats,
+        norm_stats_path=args.norm_stats_path,
+        filter_episodes_from_labels=not args.no_filter_episodes_from_labels,
     )
     for preview in loader.dataset.preview_identities(5):
         print(

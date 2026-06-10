@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+from openpi.shared import normalize as _normalize
 import openpi.training.config as _config
 import openpi.transforms as _transforms
 
@@ -67,6 +68,32 @@ def _dataset_key(value: Any) -> str:
     value = _scalar(value)
     text = str(value)
     return Path(text).name if "/" in text else text
+
+
+def _raw_sequence_key(key: str, dataset_meta: Any) -> str:
+    # Local LIBERO parquet files use "action", while the OpenPI transform output
+    # key is "actions". LeRobot delta_timestamps must reference raw dataset keys.
+    features = getattr(dataset_meta, "features", {}) or {}
+    if key in features:
+        return key
+    if key == "actions" and "action" in features:
+        return "action"
+    return key
+
+
+def _with_local_lerobot_aliases(sample: dict[str, Any]) -> dict[str, Any]:
+    sample = dict(sample)
+    aliases = {
+        "actions": "action",
+        "state": "observation.state",
+        "image": "observation.image",
+        "wrist_image": "observation.wrist_image",
+        "prompt": "task",
+    }
+    for target_key, source_key in aliases.items():
+        if target_key not in sample and source_key in sample:
+            sample[target_key] = sample[source_key]
+    return sample
 
 
 def _pick_array(npz: np.lib.npyio.NpzFile, names: Iterable[str]) -> np.ndarray:
@@ -145,6 +172,19 @@ class ActionGainLabelStore:
 
     def dataset_keys(self) -> set[str]:
         return {_dataset_key(key) for key in self.dataset_key}
+
+    def numeric_episodes_by_dataset(self) -> dict[str, list[int]]:
+        episodes: dict[str, set[int]] = {}
+        for i in range(len(self)):
+            dataset_key = _dataset_key(self.dataset_key[i])
+            episode = _episode_key(self.episode_index[i])
+            if not episode.isdigit():
+                raise ValueError(
+                    "Episode-filtered loading requires numeric episode indices, "
+                    f"got {episode!r} for dataset {dataset_key}"
+                )
+            episodes.setdefault(dataset_key, set()).add(int(episode))
+        return {dataset_key: sorted(values) for dataset_key, values in episodes.items()}
 
 
 def _find_column(source: Any, names: tuple[str, ...]) -> np.ndarray | None:
@@ -246,6 +286,7 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
         *,
         dataset_paths: Sequence[str] | None = None,
         skip_norm_stats: bool = False,
+        filter_episodes_from_labels: bool = True,
     ) -> None:
         if dataset_paths is None and data_config.repo_id is None:
             raise ValueError("ActionGainLeRobotDataset requires dataset_paths or a LeRobot repo_id")
@@ -261,6 +302,7 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
         self._transforms = []
         self._dataset_keys = []
         dataset_key_to_idx = {}
+        episodes_by_dataset = self._labels.numeric_episodes_by_dataset() if filter_episodes_from_labels else None
 
         norm_stats = {}
         if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -272,15 +314,25 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
             norm_stats = data_config.norm_stats
 
         key_to_source = {}
+        should_build_key_map = True
+        if episodes_by_dataset is None and self._labels.raw_index is not None and np.all(self._labels.raw_index >= 0):
+            should_build_key_map = False
         for dataset_path in dataset_paths:
             dataset_key = _dataset_key(dataset_path)
+            if episodes_by_dataset is not None and dataset_key not in episodes_by_dataset:
+                logger.info("Skipping dataset %s because no gain labels reference it", dataset_key)
+                continue
             if dataset_key in self._dataset_keys:
                 raise ValueError(f"Duplicate dataset key from dataset_paths: {dataset_key}")
             dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(dataset_path)
+            episodes = episodes_by_dataset.get(dataset_key) if episodes_by_dataset is not None else None
             raw_dataset = lerobot_dataset.LeRobotDataset(
                 dataset_path,
+                episodes=episodes,
                 delta_timestamps={
-                    key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
+                    _raw_sequence_key(key, dataset_meta): [
+                        t / dataset_meta.fps for t in range(model_config.action_horizon)
+                    ]
                     for key in data_config.action_sequence_keys
                 },
             )
@@ -298,9 +350,9 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
             self._dataset_keys.append(dataset_key)
             dataset_key_to_idx[dataset_key] = dataset_idx
 
-            # Prefer explicit raw LeRobot row indices when the label file has them.
-            # This avoids scanning millions of frames just to build an identity map.
-            if self._labels.raw_index is None or np.any(self._labels.raw_index < 0):
+            # Prefer key maps for episode-filtered datasets. The LeRobot row indices
+            # are re-based after filtering, so label raw_index values are not used.
+            if should_build_key_map:
                 for key, raw_index in _build_key_to_raw_index(raw_dataset, dataset_key).items():
                     if key in key_to_source:
                         raise ValueError(f"Duplicate LeRobot key across datasets: {key}")
@@ -314,7 +366,7 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
             )
 
         label_key_to_row = self._labels.as_key_to_row()
-        if self._labels.raw_index is not None and np.all(self._labels.raw_index >= 0):
+        if not should_build_key_map:
             self._sample_sources = []
             for key, label_row in label_key_to_row.items():
                 dataset_idx = dataset_key_to_idx[key[0]]
@@ -363,7 +415,7 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         dataset_idx, raw_index, label_row = self._sample_sources[index]
-        raw_sample = self._raw_datasets[dataset_idx][raw_index]
+        raw_sample = _with_local_lerobot_aliases(self._raw_datasets[dataset_idx][raw_index])
         dataset_key = self._dataset_keys[dataset_idx]
         episode_index, frame_index = _extract_episode_frame(raw_sample)
         expected_key = self._labels.key_at(label_row)
@@ -420,14 +472,22 @@ def create_action_gain_data_loader(
     seed: int,
     dataset_paths: Sequence[str] | None = None,
     skip_norm_stats: bool = False,
+    norm_stats_path: str | None = None,
+    filter_episodes_from_labels: bool = True,
 ) -> tuple[torch.utils.data.DataLoader, _config.DataConfig]:
     data_config = config.data.create(config.assets_dirs, config.model)
+    if norm_stats_path is not None:
+        norm_stats_dir = Path(norm_stats_path)
+        if norm_stats_dir.is_file():
+            norm_stats_dir = norm_stats_dir.parent
+        data_config = dataclasses.replace(data_config, norm_stats=_normalize.load(norm_stats_dir))
     dataset = ActionGainLeRobotDataset(
         data_config=data_config,
         model_config=config.model,
         labels_path=labels_path,
         dataset_paths=dataset_paths,
         skip_norm_stats=skip_norm_stats,
+        filter_episodes_from_labels=filter_episodes_from_labels,
     )
     generator = torch.Generator()
     generator.manual_seed(seed)
