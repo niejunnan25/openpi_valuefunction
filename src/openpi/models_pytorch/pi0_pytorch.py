@@ -315,7 +315,7 @@ class PI0Pytorch(nn.Module):
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """Training path: corrupt ground-truth actions to x_t and learn the flow velocity."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
@@ -324,10 +324,16 @@ class PI0Pytorch(nn.Module):
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
+        # Flow-matching convention in this implementation:
+        #   time = 1 -> pure Gaussian noise
+        #   time = 0 -> clean ground-truth action chunk
+        # During training we sample time in (0, 1), construct x_t, and regress u_t.
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        # Full training forward: prefix and suffix are run together, so suffix action
+        # tokens attend to the image/language prefix without using the inference cache.
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
@@ -374,24 +380,21 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = observation.state.shape[0]
-        if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
+    def encode_prefix_context(self, observation):
+        """Compute reusable image/language prefix K/V for inference-time suffix calls."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
+        # Prefix pass, computed once per observation. This embeds images and language,
+        # then stores their K/V states so suffix-only calls do not recompute them.
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute image and language key value cache
+        # Compute image and language key/value cache.
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -399,9 +402,34 @@ class PI0Pytorch(nn.Module):
             use_cache=True,
         )
 
+        return {
+            "state": state,
+            "prefix_out": prefix_out,
+            "prefix_pad_masks": prefix_pad_masks,
+            "past_key_values": past_key_values,
+        }
+
+    @torch.no_grad()
+    def sample_actions(self, device, observation, noise=None, num_steps=10, prefix_context=None) -> Tensor:
+        """Normal action-generation path: integrate from noise at t=1 to actions at t=0."""
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        # Reuse a caller-provided prefix context when available. This lets code that
+        # samples actions and then encodes those actions avoid recomputing embed_prefix.
+        if prefix_context is None:
+            prefix_context = self.encode_prefix_context(observation)
+        state = prefix_context["state"]
+        prefix_pad_masks = prefix_context["prefix_pad_masks"]
+        past_key_values = prefix_context["past_key_values"]
+
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
+        # Denoising / flow integration loop. Each iteration predicts a velocity v_t
+        # from the current action sample x_t, then takes one Euler step toward t=0.
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
@@ -427,7 +455,7 @@ class PI0Pytorch(nn.Module):
         x_t,
         timestep,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """One normal inference step: run only the action suffix against cached prefix K/V."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -447,6 +475,8 @@ class PI0Pytorch(nn.Module):
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # Cached suffix forward. inputs_embeds=[None, suffix_embs] means the prefix
+        # stream is not recomputed; past_key_values supplies the image/language K/V.
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -460,3 +490,76 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+    @torch.no_grad()
+    def encode_actions_joint(self, observation, actions, timestep=1e-3, prefix_context=None):
+        """Encode provided actions against a reusable prefix K/V context.
+
+        This is the added feature-extraction path, not the normal sampling path.
+        It inserts the provided action chunk directly as x_t near t=0. When a
+        prefix_context is provided, it reuses the image/language K/V from action
+        generation and runs only the action suffix. This is equivalent for suffix
+        hidden states because the prefix-LM mask does not let prefix tokens attend
+        back to suffix tokens.
+        """
+        # Standalone calls still need to build the prefix once. If this method is
+        # called after sample_actions, pass the same prefix_context to skip this work.
+        if prefix_context is None:
+            prefix_context = self.encode_prefix_context(observation)
+        state = prefix_context["state"]
+        prefix_pad_masks = prefix_context["prefix_pad_masks"]
+        past_key_values = prefix_context["past_key_values"]
+
+        # timestep ~= 0 means "clean action" under x_t = t * noise + (1 - t) * action.
+        # A small positive default stays closer to the training-time support.
+        bsize = actions.shape[0]
+        time = torch.full((bsize,), timestep, dtype=torch.float32, device=actions.device)
+
+        # Here the provided actions are encoded as suffix tokens. No denoising sample is
+        # generated in this method; actions are treated as the current x_t input.
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, actions, time)
+
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(torch.bfloat16)
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        # Cached suffix forward, matching denoise_step. inputs_embeds=[None, suffix_embs]
+        # means image/language prefix is supplied by past_key_values, not recomputed.
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        outputs_embeds, _ = self.paligemma_with_expert.forward(
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
+        prefix_out = prefix_context.get("prefix_out")
+        suffix_out = outputs_embeds[1]
+
+        # The action representation comes from the last action_horizon suffix tokens.
+        # action_out_proj maps those hidden states to the model's velocity head.
+        action_hidden = suffix_out[:, -self.config.action_horizon :].to(torch.float32)
+        pred_velocity = self.action_out_proj(action_hidden)
+
+        return {
+            "prefix_out": prefix_out,
+            "suffix_out": suffix_out,
+            "action_hidden": action_hidden,
+            "pred_velocity": pred_velocity,
+        }
