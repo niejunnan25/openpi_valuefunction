@@ -260,6 +260,7 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
         self._raw_datasets = []
         self._transforms = []
         self._dataset_keys = []
+        dataset_key_to_idx = {}
 
         norm_stats = {}
         if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -295,10 +296,15 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
             self._raw_datasets.append(raw_dataset)
             self._transforms.append(_transforms.compose(transforms))
             self._dataset_keys.append(dataset_key)
-            for key, raw_index in _build_key_to_raw_index(raw_dataset, dataset_key).items():
-                if key in key_to_source:
-                    raise ValueError(f"Duplicate LeRobot key across datasets: {key}")
-                key_to_source[key] = (dataset_idx, raw_index)
+            dataset_key_to_idx[dataset_key] = dataset_idx
+
+            # Prefer explicit raw LeRobot row indices when the label file has them.
+            # This avoids scanning millions of frames just to build an identity map.
+            if self._labels.raw_index is None or np.any(self._labels.raw_index < 0):
+                for key, raw_index in _build_key_to_raw_index(raw_dataset, dataset_key).items():
+                    if key in key_to_source:
+                        raise ValueError(f"Duplicate LeRobot key across datasets: {key}")
+                    key_to_source[key] = (dataset_idx, raw_index)
 
         missing_dataset_keys = self._labels.dataset_keys() - set(self._dataset_keys)
         if missing_dataset_keys:
@@ -308,15 +314,27 @@ class ActionGainLeRobotDataset(torch.utils.data.Dataset):
             )
 
         label_key_to_row = self._labels.as_key_to_row()
-        common_keys = [key for key in label_key_to_row if key in key_to_source]
-        missing = len(label_key_to_row) - len(common_keys)
-        if missing:
-            logger.warning("Skipping %d gain labels that are not present in the loaded LeRobot datasets", missing)
+        if self._labels.raw_index is not None and np.all(self._labels.raw_index >= 0):
+            self._sample_sources = []
+            for key, label_row in label_key_to_row.items():
+                dataset_idx = dataset_key_to_idx[key[0]]
+                raw_index = int(self._labels.raw_index[label_row])
+                if raw_index >= len(self._raw_datasets[dataset_idx]):
+                    raise IndexError(
+                        f"raw_index {raw_index} for label key {key} exceeds dataset length "
+                        f"{len(self._raw_datasets[dataset_idx])}"
+                    )
+                self._sample_sources.append((dataset_idx, raw_index, label_row))
+        else:
+            common_keys = [key for key in label_key_to_row if key in key_to_source]
+            missing = len(label_key_to_row) - len(common_keys)
+            if missing:
+                logger.warning("Skipping %d gain labels that are not present in the loaded LeRobot datasets", missing)
 
-        self._sample_sources = [
-            (*key_to_source[key], label_key_to_row[key])
-            for key in common_keys
-        ]
+            self._sample_sources = [
+                (*key_to_source[key], label_key_to_row[key])
+                for key in common_keys
+            ]
 
         if not self._sample_sources:
             raise ValueError("No gain labels matched the LeRobot dataset metadata")
