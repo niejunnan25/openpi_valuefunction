@@ -418,6 +418,27 @@ def query_diagnostics(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any
         by_var[("ALL", "ALL", method)].append(var)
     method_rows = []
     component_keys = ["image_mass", "visual_concentration", "language_mass", "alignment"]
+    metadata_cache: dict[str, dict[str, Any]] = {}
+
+    def npz_metadata(rec: dict[str, Any]) -> dict[str, Any]:
+        attention_path = rec.get("attention_map_path")
+        if not attention_path:
+            return {}
+        path = pathlib.Path(str(attention_path))
+        if not path.is_absolute():
+            path = ROOT / path
+        cache_key = str(path)
+        if cache_key in metadata_cache:
+            return metadata_cache[cache_key]
+        metadata: dict[str, Any] = {}
+        try:
+            with np.load(path, allow_pickle=True) as data:
+                if "metadata_json" in data.files:
+                    metadata = json.loads(str(data["metadata_json"]))
+        except Exception:
+            metadata = {}
+        metadata_cache[cache_key] = metadata
+        return metadata
 
     def selected_component(rec: dict[str, Any], key: str) -> float:
         value = rec.get("selected_score_components", {})
@@ -426,6 +447,13 @@ def query_diagnostics(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any
                 value = json.loads(value)
             except Exception:
                 value = {}
+        if isinstance(value, dict) and key in value:
+            try:
+                return float(value[key])
+            except Exception:
+                return float("nan")
+        metadata = npz_metadata(rec)
+        value = metadata.get("selected_score_components", {})
         if isinstance(value, dict) and key in value:
             try:
                 return float(value[key])
