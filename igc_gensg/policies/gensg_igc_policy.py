@@ -366,11 +366,13 @@ class GenSGIGCPolicy(_policy.BasePolicy):
         selected_w = None
         selected_grids = None
         selected_maps_for_score = token_maps
+        selected_components = None
         for layer, head in self._config.generation_heads:
             local_layer = layer_indices.index(layer)
             grids = np.asarray(agg_img[local_layer, :, head], dtype=np.float32)
             langs = np.asarray(agg_lang[local_layer, :, head], dtype=np.float32)
             raw_scores = None
+            components: dict[str, np.ndarray] = {}
             if method in PURE_22_METHODS:
                 pure = compute_pure_scores(grids)
                 scores = np.asarray(pure["score_imc"], dtype=np.float64)
@@ -404,8 +406,16 @@ class GenSGIGCPolicy(_policy.BasePolicy):
                     # static saliency, not like an accidental k4_first baseline.
                     scores = static_score + np.random.default_rng(seed).random(grids.shape[0]) * 1e-9
                     contrib = np.zeros((grids.shape[0], token_mask.shape[0]), dtype=np.float64)
+                    components = {}
                 else:
-                    scores, contrib = gensg_score(grids, lang_for_score, maps_for_score, q_for_score, token_mask)
+                    scores, contrib, components = gensg_score(
+                        grids,
+                        lang_for_score,
+                        maps_for_score,
+                        q_for_score,
+                        token_mask,
+                        return_components=True,
+                    )
                 if method == "gensg_last3_score_mismatch":
                     raw_scores = np.asarray(scores, dtype=np.float64)
                     scores = np.roll(raw_scores, 1)
@@ -421,6 +431,7 @@ class GenSGIGCPolicy(_policy.BasePolicy):
                 selected_w = langs
                 selected_grids = grids
                 selected_maps_for_score = maps_for_score if "maps_for_score" in locals() else token_maps
+                selected_components = components if "components" in locals() else None
         scores = np.mean(np.stack(per_head_scores, axis=0), axis=0)
         selected = int(np.argmax(scores))
         w_selected = None if selected_w is None else np.asarray(selected_w[selected], dtype=np.float64)
@@ -442,6 +453,15 @@ class GenSGIGCPolicy(_policy.BasePolicy):
             "selected_prefix_heads": grounding.get("selected_prefix_heads"),
             "action_token_count": int(run.get("action_token_count", self._config.execution_action_tokens)),
         }
+        if selected_components:
+            metadata["candidate_score_components"] = {
+                key: [float(x) for x in np.asarray(value, dtype=np.float64).tolist()]
+                for key, value in selected_components.items()
+            }
+            metadata["selected_score_components"] = {
+                key: float(np.asarray(value, dtype=np.float64)[selected])
+                for key, value in selected_components.items()
+            }
         arrays.update(
             {
                 "scores": scores.astype(np.float32),
@@ -455,6 +475,9 @@ class GenSGIGCPolicy(_policy.BasePolicy):
             arrays["selected_A"] = np.asarray(selected_grids[selected], dtype=np.float32)
         if w_selected is not None:
             arrays["selected_W"] = np.asarray(w_selected, dtype=np.float32)
+        if selected_components:
+            for key, value in selected_components.items():
+                arrays[f"component_{key}"] = np.asarray(value, dtype=np.float32)
         attention_path = self._save_attention(
             context=context,
             method=method,
@@ -624,6 +647,8 @@ class GenSGIGCPolicy(_policy.BasePolicy):
             "top_tokens_by_W": score_meta.get("top_tokens_by_W", []),
             "top_contributing_tokens": score_meta.get("top_contributing_tokens", []),
             "selected_prefix_heads": score_meta.get("selected_prefix_heads", []),
+            "candidate_score_components": score_meta.get("candidate_score_components", {}),
+            "selected_score_components": score_meta.get("selected_score_components", {}),
             "success": None,
         }
         self._query_index += 1

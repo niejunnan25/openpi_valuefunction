@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 
-AGGREGATIONS = ("last1", "last3_mean", "last5_mean", "all_steps_mean")
+AGGREGATIONS = ("early1", "middle1", "last1", "last3_mean", "last5_mean", "all_steps_mean")
 PURE_SCORE_NAMES = ("score_topq", "score_entropy", "score_imc")
 
 
@@ -593,7 +593,7 @@ def compute_grounding_quality(
     token_distinct = js_divergence(maps, mean_token_map[:, :, None, :])
     occurrence_penalty = np.ones((j,), dtype=np.float64)
     if token_ids is not None:
-        ids = [int(x) for x, valid in zip(token_ids, token_mask, strict=False) if bool(valid)]
+        ids = [int(x) for x, valid in zip(token_ids, token_mask) if bool(valid)]
         counts = Counter(ids)
         occurrence_penalty = np.asarray(
             [1.0 / math.sqrt(max(1, counts.get(int(token_id), 1))) for token_id in token_ids],
@@ -684,7 +684,9 @@ def gensg_score(
     token_maps: np.ndarray,
     q: np.ndarray,
     token_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+    *,
+    return_components: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     k = int(action_image_grids.shape[0])
     action_flat = np.asarray(action_image_grids, dtype=np.float64).reshape(k, -1)
     image_mass = action_flat.sum(axis=-1)
@@ -705,6 +707,14 @@ def gensg_score(
     contrib = weighted * overlap
     alignment = contrib.sum(axis=-1)
     scores = image_mass * visual_concentration * language_mass * alignment
+    if return_components:
+        components = {
+            "image_mass": image_mass.astype(np.float64),
+            "visual_concentration": np.asarray(visual_concentration, dtype=np.float64),
+            "language_mass": language_mass.astype(np.float64),
+            "alignment": alignment.astype(np.float64),
+        }
+        return scores, contrib, components
     return scores, contrib
 
 
@@ -950,12 +960,22 @@ def main() -> None:
                     langs = np.asarray(agg_lang[li, :, head], dtype=np.float32)
                     pure = compute_pure_scores(grids)
                     gensg, contrib = gensg_score(grids, langs, grounding["maps"], q, token_mask)
+                    no_q, _ = gensg_score(
+                        grids,
+                        langs,
+                        grounding["maps_no_q"],
+                        grounding["q_no_q"],
+                        token_mask,
+                    )
+                    no_w, _ = gensg_score(grids, np.ones_like(langs), grounding["maps"], q, token_mask)
                     random_token, _ = gensg_score(grids, langs, grounding["random_token_maps"], q, token_mask)
                     shuffled, _ = gensg_score(grids, langs, grounding["shuffled_maps"], q, token_mask)
                     random_prefix, _ = gensg_score(grids, langs, grounding["random_maps"], grounding["random_q"], token_mask)
                     center_prior, _ = gensg_score(grids, langs, grounding["center_maps"], grounding["center_q"], token_mask)
                     score_dict = {
                         "gensg": gensg,
+                        "no_q": no_q,
+                        "no_W": no_w,
                         "random_token": random_token,
                         "shuffled_token": shuffled,
                         "random_prefix_head": random_prefix,
@@ -1040,7 +1060,9 @@ def main() -> None:
             action_language=action_language,
             prefix_grounding=prefix_context["prefix_grounding"],
             gensg_maps=grounding["maps"],
+            gensg_maps_no_q=grounding["maps_no_q"],
             q=q,
+            q_no_q=grounding["q_no_q"],
             token_mask=token_mask,
             token_ids=np.asarray(prefix_context["token_ids"]),
             raw_token_mask=raw_token_mask,
@@ -1142,14 +1164,67 @@ def main() -> None:
     top1_nonentity_rate = top1_nonentity / max(len(token_by_obs), 1)
     top3_nonentity_rate = top3_nonentity / max(top3_total, 1)
     token_purity_ok = top1_nonentity_rate <= 0.25 and top3_nonentity_rate <= 0.25
+    def find_metric(score_name: str, aggregation: str, layer: Any, head: Any) -> dict[str, Any] | None:
+        for row in metric_rows:
+            if (
+                row["score_name"] == score_name
+                and row["aggregation"] == aggregation
+                and int(row["layer"]) == int(layer)
+                and int(row["head"]) == int(head)
+            ):
+                return row
+        return None
+
+    control_score_names = ("random_token", "shuffled_token", "random_prefix_head", "center_prior")
+    def control_max_for(row: dict[str, Any] | None) -> float:
+        if row is None:
+            return float("inf")
+        vals = []
+        for name in control_score_names:
+            ctrl = find_metric(name, row["aggregation"], row["layer"], row["head"])
+            if ctrl is not None:
+                vals.append(float(ctrl["score_variance_mean"]))
+        return max(vals) if vals else float("inf")
+
     top_gensg = gensg_rows[:10]
     last_rows = [r for r in gensg_rows if r["aggregation"] in {"last1", "last3_mean", "last5_mean"}]
+    phase2_rows = [r for r in gensg_rows if r["aggregation"] in {"last1", "last3_mean"}]
+    phase2_clean_rows = [r for r in phase2_rows if float(r["score_variance_mean"]) >= control_max_for(r)]
+    phase2_recommendation = (
+        phase2_clean_rows[0]
+        if phase2_clean_rows
+        else (phase2_rows[0] if phase2_rows else (gensg_rows[0] if gensg_rows else None))
+    )
+    recommended_control_max = control_max_for(phase2_recommendation)
+    recommended_gensg_var = (
+        float(phase2_recommendation["score_variance_mean"]) if phase2_recommendation is not None else float("nan")
+    )
+    controls_not_better = bool(
+        phase2_recommendation is not None
+        and math.isfinite(recommended_control_max)
+        and recommended_gensg_var >= recommended_control_max
+    )
+    early_rows = [r for r in gensg_rows if r["aggregation"] in {"early1", "middle1"}]
     all_rows = [r for r in gensg_rows if r["aggregation"] == "all_steps_mean"]
     late_better_than_all = mean([float(r["score_variance_mean"]) for r in last_rows[:20]]) >= mean(
         [float(r["score_variance_mean"]) for r in all_rows[:20]]
     )
-    if shape_ok and prefix_ok and q_ok and token_maps_ok and gensg_var_ok and selected_ok and token_purity_ok:
+    late_better_than_early = mean([float(r["score_variance_mean"]) for r in last_rows[:20]]) >= mean(
+        [float(r["score_variance_mean"]) for r in early_rows[:20]]
+    )
+    if (
+        shape_ok
+        and prefix_ok
+        and q_ok
+        and token_maps_ok
+        and gensg_var_ok
+        and selected_ok
+        and token_purity_ok
+        and controls_not_better
+    ):
         conclusion = "通过" if late_better_than_all else "部分通过"
+    elif shape_ok and prefix_ok and gensg_var_ok and not controls_not_better:
+        conclusion = "证据不足"
     elif shape_ok and prefix_ok and gensg_var_ok:
         conclusion = "部分通过"
     else:
@@ -1187,6 +1262,8 @@ def main() -> None:
         f"- top token diagnostic is clean enough: {token_purity_ok} (top1 function/relation-like rate={top1_nonentity_rate:.3f}, top3 rate={top3_nonentity_rate:.3f})",
         f"- GenSG score has non-zero candidate variance: {gensg_var_ok}",
         f"- GenSG selected index is not fixed for at least one head/time: {selected_ok}",
+        f"- GenSG is not weaker than random/shuffled/center controls at the recommended head/time: {controls_not_better}",
+        f"- late-step aggregation is at least as discriminative as early/middle steps: {late_better_than_early}",
         f"- late-step aggregation is at least as discriminative as all-steps mean: {late_better_than_all}",
         "",
         "## Top GenSG Head/Time Rows",
@@ -1198,6 +1275,33 @@ def main() -> None:
             f"var={float(row['score_variance_mean']):.4g}, selected_entropy={float(row['selected_index_entropy']):.4g}, "
             f"counts={row['selected_index_counts']}"
         )
+    report_lines += ["", "## Recommended Stage2 Configuration", ""]
+    if phase2_recommendation is None:
+        report_lines.append("- No valid GenSG row found; do not enter Stage2.")
+    else:
+        report_lines.extend(
+            [
+                f"- action head: layer {phase2_recommendation['layer']} head {phase2_recommendation['head']}",
+                f"- time aggregation: {phase2_recommendation['aggregation']}",
+                f"- prefix_top_heads: {args.prefix_top_heads}",
+                f"- camera: {args.camera}",
+                f"- execution_action_tokens: {args.execution_action_tokens}",
+                f"- K: {args.k}",
+                f"- recommendation source: top GenSG row constrained to last1/last3_mean, rank {phase2_recommendation['rank']}",
+            ]
+        )
+        report_lines.append(
+            f"- same-head control max variance: {recommended_control_max:.4g}; GenSG variance: {recommended_gensg_var:.4g}"
+        )
+    report_lines += ["", "## Time Aggregation Comparison", ""]
+    for aggregation in AGGREGATIONS:
+        rows = [r for r in gensg_rows if r["aggregation"] == aggregation][:3]
+        report_lines.append(f"- {aggregation}:")
+        for row in rows:
+            report_lines.append(
+                f"  - layer {row['layer']} head {row['head']}, "
+                f"var={float(row['score_variance_mean']):.4g}, selected_entropy={float(row['selected_index_entropy']):.4g}"
+            )
     report_lines += ["", "## Pure 2.2 Score References", ""]
     for name in PURE_SCORE_NAMES:
         rows = top_by(name, 3)
@@ -1207,14 +1311,34 @@ def main() -> None:
                 f"  - {row['aggregation']} layer {row['layer']} head {row['head']}, "
                 f"var={float(row['score_variance_mean']):.4g}, selected_entropy={float(row['selected_index_entropy']):.4g}"
             )
-    report_lines += ["", "## Control Score Rows", ""]
-    for name in ("random_token", "shuffled_token", "random_prefix_head", "center_prior"):
+    report_lines += ["", "## GenSG Ablations and Control Score Rows", ""]
+    for name in ("no_q", "no_W", "random_token", "shuffled_token", "random_prefix_head", "center_prior"):
         rows = top_by(name, 3)
         report_lines.append(f"- {name}:")
         for row in rows:
             report_lines.append(
                 f"  - {row['aggregation']} layer {row['layer']} head {row['head']}, "
                 f"var={float(row['score_variance_mean']):.4g}, selected_entropy={float(row['selected_index_entropy']):.4g}"
+            )
+    if phase2_recommendation is not None:
+        report_lines += ["", "## Same-Head Controls for Recommended Configuration", ""]
+        for name in ("gensg", "no_q", "no_W", *control_score_names):
+            row = find_metric(
+                name,
+                phase2_recommendation["aggregation"],
+                phase2_recommendation["layer"],
+                phase2_recommendation["head"],
+            )
+            if row is None:
+                continue
+            report_lines.append(
+                f"- {name}: var={float(row['score_variance_mean']):.4g}, "
+                f"selected_entropy={float(row['selected_index_entropy']):.4g}, counts={row['selected_index_counts']}"
+            )
+        if not controls_not_better:
+            report_lines.append(
+                "- Negative controls are comparable to or stronger than GenSG at the recommended configuration; "
+                "阶段一证据不足，不能进入大规模阶段二。"
             )
     report_lines += ["", "## Top Token Quality Examples", ""]
     for row in obs_rows[: min(8, len(obs_rows))]:
@@ -1249,9 +1373,13 @@ def main() -> None:
             "top3_function_or_relation_like_rate": top3_nonentity_rate,
             "gensg_var_ok": gensg_var_ok,
             "selected_ok": selected_ok,
+            "controls_not_better": controls_not_better,
+            "recommended_control_max": recommended_control_max,
+            "late_better_than_early": late_better_than_early,
             "late_better_than_all": late_better_than_all,
         },
         "top_gensg": top_gensg,
+        "recommended_stage2": phase2_recommendation,
         "outputs": {
             "report": str(report_path.relative_to(root)),
             "metrics": str((results_dir / "stage1_gensg_head_time_metrics.csv").relative_to(root)),

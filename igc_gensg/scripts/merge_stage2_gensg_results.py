@@ -417,26 +417,45 @@ def query_diagnostics(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any
         by_var[(str(rec.get("suite")), str(rec.get("task_id")), method)].append(var)
         by_var[("ALL", "ALL", method)].append(var)
     method_rows = []
+    component_keys = ["image_mass", "visual_concentration", "language_mass", "alignment"]
+
+    def selected_component(rec: dict[str, Any], key: str) -> float:
+        value = rec.get("selected_score_components", {})
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                value = {}
+        if isinstance(value, dict) and key in value:
+            try:
+                return float(value[key])
+            except Exception:
+                return float("nan")
+        return float("nan")
+
     for method, rs in sorted(by_method.items()):
         selected = [int(r.get("selected_index")) for r in rs if r.get("selected_index") is not None]
         counts = collections.Counter(selected)
         total = sum(counts.values())
         probs = np.asarray([v / total for v in counts.values()], dtype=np.float64) if total else np.asarray([])
         entropy = float(-np.sum(probs * np.log(probs + 1e-12)) / math.log(max(len(counts), 2))) if total else float("nan")
-        method_rows.append(
-            {
-                "method": method,
-                "n_queries": len(rs),
-                "selected_counts": json.dumps(dict(sorted(counts.items())), sort_keys=True),
-                "selected_max_frac": max(counts.values()) / total if total else float("nan"),
-                "selected_entropy_norm": max(0.0, min(1.0, entropy)) if math.isfinite(entropy) else entropy,
-                "score_variance_mean": mean([float(r.get("score_variance", 0.0) or 0.0) for r in rs]),
-                "runtime_ms": mean([float(r.get("runtime_ms", 0.0) or 0.0) for r in rs]),
-                "generation_attention_runtime_ms": mean([float(r.get("generation_attention_runtime_ms", 0.0) or 0.0) for r in rs]),
-                "scoring_ms": mean([float(r.get("scoring_ms", 0.0) or 0.0) for r in rs]),
-                "candidate_pairwise_l2_mean": mean([float(r.get("candidate_action_pairwise_l2_mean", 0.0) or 0.0) for r in rs]),
-            }
-        )
+        row = {
+            "method": method,
+            "n_queries": len(rs),
+            "selected_counts": json.dumps(dict(sorted(counts.items())), sort_keys=True),
+            "selected_max_frac": max(counts.values()) / total if total else float("nan"),
+            "selected_entropy_norm": max(0.0, min(1.0, entropy)) if math.isfinite(entropy) else entropy,
+            "score_variance_mean": mean([float(r.get("score_variance", 0.0) or 0.0) for r in rs]),
+            "runtime_ms": mean([float(r.get("runtime_ms", 0.0) or 0.0) for r in rs]),
+            "generation_attention_runtime_ms": mean([float(r.get("generation_attention_runtime_ms", 0.0) or 0.0) for r in rs]),
+            "scoring_ms": mean([float(r.get("scoring_ms", 0.0) or 0.0) for r in rs]),
+            "candidate_pairwise_l2_mean": mean([float(r.get("candidate_action_pairwise_l2_mean", 0.0) or 0.0) for r in rs]),
+        }
+        for key in component_keys:
+            vals = [selected_component(r, key) for r in rs]
+            vals = [v for v in vals if math.isfinite(v)]
+            row[f"selected_{key}_mean"] = mean(vals)
+        method_rows.append(row)
     selected_rows = []
     for (suite, task_id, method), counts in sorted(by_selected.items()):
         total = sum(counts.values())
@@ -557,10 +576,19 @@ def write_report(
     for row in comparisons:
         if row["method"] in FOCUS_22:
             lines.append(f"| {row['scope']} | {row['method']} | {row['baseline']} | {fmt(row['diff'])} | [{fmt(row['ci_low'])}, {fmt(row['ci_high'])}] | {row['wins']} | {row['losses']} | {row['ties']} |")
-    lines.extend(["", "## Query Diagnostics", "| method | queries | selected max frac | selected entropy | score var | runtime ms | generation attention ms | 2.1 scoring ms | action L2 |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"])
+    lines.extend(["", "## Query Diagnostics", "| method | queries | selected max frac | selected entropy | score var | runtime ms | generation attention ms | 2.1 scoring ms | action L2 | image mass | concentration | language mass | alignment |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"])
     for row in method_diag:
         if row["method"] in methods:
-            lines.append(f"| {row['method']} | {row['n_queries']} | {fmt(row['selected_max_frac'])} | {fmt(row['selected_entropy_norm'])} | {fmt(row['score_variance_mean'],6)} | {fmt(row['runtime_ms'],1)} | {fmt(row['generation_attention_runtime_ms'],1)} | {fmt(row['scoring_ms'],1)} | {fmt(row['candidate_pairwise_l2_mean'],3)} |")
+            lines.append(
+                f"| {row['method']} | {row['n_queries']} | {fmt(row['selected_max_frac'])} | "
+                f"{fmt(row['selected_entropy_norm'])} | {fmt(row['score_variance_mean'],6)} | "
+                f"{fmt(row['runtime_ms'],1)} | {fmt(row['generation_attention_runtime_ms'],1)} | "
+                f"{fmt(row['scoring_ms'],1)} | {fmt(row['candidate_pairwise_l2_mean'],3)} | "
+                f"{fmt(row.get('selected_image_mass_mean', float('nan')),4)} | "
+                f"{fmt(row.get('selected_visual_concentration_mean', float('nan')),4)} | "
+                f"{fmt(row.get('selected_language_mass_mean', float('nan')),4)} | "
+                f"{fmt(row.get('selected_alignment_mean', float('nan')),4)} |"
+            )
     lines.extend(["", "## By Suite", "| suite | method | n | success |", "|---|---|---:|---:|"])
     suites = sorted({r.get("suite") for r in summary_suite})
     for suite in suites:
